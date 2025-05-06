@@ -1,0 +1,2 @@
+# AI--Enabled-hybrid-approach-for-Detection-And-Prediction-Of-Cyber-Theft
+This project is a hybrid AI-based system developed in Python to detect and prevent cyber theft through spam SMS and emails. It combines machine learning algorithms with rule-based filtering techniques to accurately classify messages as spam or ham (not spam), thereby reducing the risk of phishing and other social engineering attacks.
