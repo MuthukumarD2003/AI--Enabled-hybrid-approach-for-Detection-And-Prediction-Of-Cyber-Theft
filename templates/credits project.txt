@@ -1,0 +1,5 @@
+qUzeAyzhMrr17sO6
+
+dmuthukumar13
+
+mongosh "mongodb+srv://cluster0.k0csyo8.mongodb.net/" --apiVersion 1 --username dmuthukumar13 --password qUzeAyzhMrr17sO6

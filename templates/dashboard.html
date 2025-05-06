@@ -1,0 +1,51 @@
+{% extends "base.html" %}
+
+{% block title %}Dashboard{% endblock %}
+
+{% block content %}
+<div class="container mt-5">
+    <div class="row">
+        <div class="col-md-12">
+            <div class="card">
+                <div class="card-header">
+                    <h3>Dashboard</h3>
+                </div>
+                <div class="card-body">
+                    <h5 class="card-title">Welcome, {{ current_user.username }}</h5>
+                    <p class="card-text">This is your personal dashboard. You can view and manage your account information here.</p>
+                    
+                    <div class="row mt-4">
+                        <div class="col-md-4">
+                            <div class="card mb-4">
+                                <div class="card-body">
+                                    <h5 class="card-title">Profile</h5>
+                                    <p class="card-text">View and update your profile information.</p>
+                                    <a href="#" class="btn btn-primary">Go to Profile</a>
+                                </div>
+                            </div>
+                        </div>
+                        <div class="col-md-4">
+                            <div class="card mb-4">
+                                <div class="card-body">
+                                    <h5 class="card-title">Settings</h5>
+                                    <p class="card-text">Manage your account settings and preferences.</p>
+                                    <a href="#" class="btn btn-primary">Go to Settings</a>
+                                </div>
+                            </div>
+                        </div>
+                        <div class="col-md-4">
+                            <div class="card mb-4">
+                                <div class="card-body">
+                                    <h5 class="card-title">Activity</h5>
+                                    <p class="card-text">View your recent activity and history.</p>
+                                    <a href="#" class="btn btn-primary">View Activity</a>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}
