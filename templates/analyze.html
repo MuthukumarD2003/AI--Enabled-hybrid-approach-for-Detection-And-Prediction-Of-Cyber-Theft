@@ -1,0 +1,51 @@
+{% extends "base.html" %}
+
+{% block content %}
+<div class="container mt-4">
+    <div class="row">
+        <div class="col-md-12">
+            <h2>Analyze Message for Scams</h2>
+            <p class="lead">Paste your suspicious email or SMS message below for analysis.</p>
+
+            {% with messages = get_flashed_messages() %}
+              {% if messages %}
+                {% for message in messages %}
+                  <div class="alert alert-info">{{ message }}</div>
+                {% endfor %}
+              {% endif %}
+            {% endwith %}
+
+            <div class="card">
+                <div class="card-body">
+                    <form method="post" action="{{ url_for('analyze') }}">
+                        <div class="form-group mb-3">
+                            <label for="type">Message Type:</label>
+                            <select class="form-control" id="type" name="type" required>
+                                <option value="email">Email</option>
+                                <option value="sms">SMS</option>
+                            </select>
+                        </div>
+
+                        <div class="form-group mb-3">
+                            <label for="content">Message Content:</label>
+                            <textarea class="form-control" id="content" name="content" rows="8" required
+                                placeholder="Paste your message here..."></textarea>
+                        </div>
+
+                        <button type="submit" class="btn btn-primary">Analyze Message</button>
+                    </form>
+                </div>
+            </div>
+
+            <div class="mt-4">
+                <h4>How our analysis works:</h4>
+                <ul>
+                    <li>Rule-based pattern detection - Identifies common scam phrases and suspicious patterns</li>
+                    <li>AI-powered content analysis - Evaluates message content using machine learning</li>
+                    <li>URL safety check - Inspects links for potential phishing attempts</li>
+                </ul>
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}

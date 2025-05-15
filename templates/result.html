@@ -1,0 +1,114 @@
+{% extends "base.html" %}
+
+{% block content %}
+<div class="container mt-4">
+    <div class="row">
+        <div class="col-md-12">
+            <div class="d-flex justify-content-between align-items-center mb-4">
+                <h2>Analysis Results</h2>
+                <a href="{{ url_for('analyze') }}" class="btn btn-outline-primary">Analyze Another</a>
+            </div>
+
+            <div class="card mb-4">
+                <div class="card-header {% if result.is_scam %}bg-danger text-white{% else %}bg-success text-white{% endif %}">
+                    <h4>
+                        {% if result.is_scam %}
+                            <i class="fas fa-exclamation-triangle me-2"></i> Scam Detected
+                        {% else %}
+                            <i class="fas fa-check-circle me-2"></i> Message Appears Safe
+                        {% endif %}
+                    </h4>
+                </div>
+                <div class="card-body">
+                    <h5>Confidence: <span class="badge {% if result.is_scam %}bg-danger{% else %}bg-success{% endif %}">
+                        {{ "%.1f"|format(result.confidence * 100) }}%
+                    </span></h5>
+
+                    <div class="mt-3">
+                        <h5>Message Type: <span class="badge bg-info">{{ content_type }}</span></h5>
+                    </div>
+
+                    <hr>
+
+                    <h5>Detailed Analysis:</h5>
+                    <div class="alert {% if result.is_scam %}alert-danger{% else %}alert-success{% endif %}">
+                        <strong>Primary finding:</strong> {{ result.reason }}
+                    </div>
+
+                    {% if result.detected_patterns %}
+                    <div class="mt-3">
+                        <h5>Suspicious Patterns Detected:</h5>
+                        <ul class="list-group">
+                            {% for pattern in result.detected_patterns %}
+                            <li class="list-group-item list-group-item-danger">
+                                <strong>{{ pattern.name }}:</strong>
+                                <span class="content-highlight">{{ pattern.example }}</span>
+                                <small class="text-muted d-block mt-1">{{ pattern.explanation }}</small>
+                            </li>
+                            {% endfor %}
+                        </ul>
+                    </div>
+                    {% endif %}
+
+                    {% if urls %}
+                    <div class="mt-4">
+                        <h5>URL Analysis:</h5>
+                        <div class="table-responsive">
+                            <table class="table table-bordered">
+                                <thead>
+                                    <tr>
+                                        <th>URL</th>
+                                        <th>Status</th>
+                                        <th>Reason</th>
+                                    </tr>
+                                </thead>
+                                <tbody>
+                                    {% for url, analysis in urls.items() %}
+                                    <tr>
+                                        <td><code>{{ url }}</code></td>
+                                        <td>
+                                            {% if analysis.safe %}
+                                            <span class="badge bg-success">Safe</span>
+                                            {% else %}
+                                            <span class="badge bg-danger">Suspicious</span>
+                                            {% endif %}
+                                        </td>
+                                        <td>{{ analysis.reason }}</td>
+                                    </tr>
+                                    {% endfor %}
+                                </tbody>
+                            </table>
+                        </div>
+                    </div>
+                    {% endif %}
+                </div>
+            </div>
+
+            <div class="card">
+                <div class="card-header">
+                    <h5>Original Message</h5>
+                </div>
+                <div class="card-body">
+                    <div class="message-content p-3 bg-light">
+                        <pre style="white-space: pre-wrap; font-family: inherit;">{{ content }}</pre>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<style>
+.content-highlight {
+    background-color: rgba(255, 0, 0, 0.1);
+    padding: 2px 4px;
+    border-radius: 3px;
+}
+.message-content {
+    border: 1px solid #ddd;
+    border-radius: 5px;
+    max-height: 300px;
+    overflow-y: auto;
+}
+</style>
+{% endblock %}
