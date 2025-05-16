@@ -1,1140 +1,459 @@
-import re, sqlite3, hashlib, urllib.parse, requests, ssl, socket, joblib
-from datetime import datetime
-from flask import Flask, render_template, request, redirect, url_for, session, flash
-from flask_wtf import FlaskForm, CSRFProtect
-from wtforms import StringField, PasswordField, SubmitField, TextAreaField
-from wtforms.validators import DataRequired, Email, Length, EqualTo
-from nltk.tokenize import word_tokenize
-from nltk.corpus import stopwords
-import nltk, numpy as np, ipaddress, tldextract
-from bs4 import BeautifulSoup
+from flask import Flask, request, jsonify, render_template, session, redirect, url_for, flash
+import re
+import requests
+import numpy as np
+import os
+import tensorflow as tf
+from transformers import pipeline, AutoTokenizer, AutoModelForSequenceClassification
+from flask_sqlalchemy import SQLAlchemy
+from werkzeug.security import generate_password_hash, check_password_hash
+import logging
 
-# Ensure NLTK data is available
-for resource in ['punkt', 'stopwords']:
-    try: nltk.data.find(f'tokenizers/{resource}' if resource == 'punkt' else f'corpora/{resource}')
-    except LookupError: nltk.download(resource)
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Suppress TensorFlow warnings
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'  # 0=all, 1=info, 2=warning, 3=error
+
+# Force CPU usage if needed
+os.environ["CUDA_VISIBLE_DEVICES"] = "-1"  # Comment this line if you want to use GPU
+print("Device set to use cpu")
 
 app = Flask(__name__)
-app.config['SECRET_KEY'] = 'your_very_secure_secret_key_here'
-csrf = CSRFProtect(app)
+app.config['SECRET_KEY'] = 'cyber-theft-prevention-secret-key'
+app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///users.db'
+app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+db = SQLAlchemy(app)
 
-def get_db_connection():
-    conn = sqlite3.connect('users.db')
-    conn.row_factory = sqlite3.Row
-    return conn
-
-def init_db():
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute('''CREATE TABLE IF NOT EXISTS users (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        username TEXT UNIQUE NOT NULL,
-        email TEXT UNIQUE NOT NULL,
-        password TEXT NOT NULL,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    )''')
-    cursor.execute('''CREATE TABLE IF NOT EXISTS scan_history (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        user_id INTEGER,
-        content TEXT NOT NULL,
-        result TEXT NOT NULL,
-        scanned_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        FOREIGN KEY (user_id) REFERENCES users (id)
-    )''')
-    conn.commit(); conn.close()
-
-init_db()
-
-# Forms
-class LoginForm(FlaskForm):
-    username = StringField('Username', validators=[DataRequired()])
-    password = PasswordField('Password', validators=[DataRequired()])
-    submit = SubmitField('Login')
-
-class RegisterForm(FlaskForm):
-    username = StringField('Username', validators=[DataRequired(), Length(4, 20)])
-    email = StringField('Email', validators=[DataRequired(), Email()])
-    password = PasswordField('Password', validators=[DataRequired(), Length(min=8)])
-    confirm_password = PasswordField('Confirm Password', validators=[DataRequired(), EqualTo('password')])
-    submit = SubmitField('Register')
-
-class ScanForm(FlaskForm):
-    content = TextAreaField('Paste email or SMS content here', validators=[DataRequired()])
-    submit = SubmitField('Scan')
-
-# Feature extraction
-def extract_features(text):
-    features = {
-        'text_length': len(text),
-        'word_count': len(text.split()),
-        'url_count': len(re.findall(r'https?://\S+', text)),
-        'email_count': len(re.findall(r'[\w\.-]+@[\w\.-]+', text)),
-        'phone_count': len(re.findall(r'\b(?:\+?(\d{1,3}))?[-. (]*\d{3}[-. )]*\d{3}[-. ]*\d{4}\b', text)),
-        'special_char_ratio': len(re.findall(r'[^a-zA-Z0-9\s]', text)) / max(1, len(text)),
-        'exclamation_count': text.count('!'),
-        'question_count': text.count('?')
-    }
-    words = text.split()
-    features['uppercase_ratio'] = len([w for w in words if w.isupper() and len(w) > 1]) / max(1, len(words))
-    suspicious_words = ['urgent', 'alert', 'attention', 'bank', 'account', 'verify', 'click',
-                        'confirm', 'update', 'password', 'credit', 'win', 'free', 'money',
-                        'prize', 'lottery', 'million', 'offer', 'limited', 'bitcoin',
-                        'cryptocurrency', 'wallet', 'payment', 'transfer', 'investment']
-    for word in suspicious_words:
-        features[f'contains_{word}'] = int(word in text.lower())
-    return features
-
-def analyze_url(url):
-    result = {'is_suspicious': False, 'reasons': []}
-    try:
-        parsed = urllib.parse.urlparse(url)
-        ext = tldextract.extract(url)
-        domain, suffix, sub = ext.domain, ext.suffix, ext.subdomain
-
-        def flag(reason): result.update(is_suspicious=True); result['reasons'].append(reason)
-
-        if parsed.scheme == 'http': flag("Uses HTTP")
-        if suffix in ['tk', 'ml', 'ga', 'cf', 'gq', 'xyz', 'top', 'club', 'work', 'date', 'racing']:
-            flag(f"Suspicious TLD: .{suffix}")
-        if re.match(r'\d+\.\d+\.\d+\.\d+', domain): flag("Domain is IP address")
-        if len(domain) > 25: flag("Long domain name")
-        if len(sub) > 25: flag("Long subdomain")
-        if sub.count('.') > 2: flag("Too many subdomains")
-        if '@' in url: flag("Contains '@' symbol")
-        if len(parsed.query) > 100: flag("Excessive query params")
-        if any(w in domain.lower() for w in ['secure', 'account', 'banking', 'login', 'verify',
-                                             'ebay', 'paypal', 'amazon', 'apple', 'microsoft',
-                                             'netflix', 'bank', 'update', 'service']):
-            flag("Suspicious keyword in domain")
-        if any(short in url.lower() for short in ['bit.ly', 'goo.gl', 't.co', 'tinyurl.com',
-                                                  'is.gd', 'cli.gs', 'ow.ly', 'j.mp',
-                                                  'tickurl.com', 'qr.net', 'cutt.ly']):
-            flag("URL shortening service")
-        if any(kd in parsed.path.lower() and kd not in domain.lower()
-               for kd in ['paypal', 'google', 'apple', 'microsoft', 'amazon', 'facebook']):
-            flag("Fake domain in path")
-    except Exception as e:
-        result.update(is_suspicious=True)
-        result['reasons'].append(f"URL analysis error: {str(e)}")
-    return result
-
-def ml_prediction(text):
-    features = extract_features(text)
-    score = (
-        20 * (features['url_count'] > 0) +
-        10 * (features['special_char_ratio'] > 0.1) +
-        15 * (features['uppercase_ratio'] > 0.3) +
-        5 * (features['exclamation_count'] > 3) +
-        5 * sum(v for k, v in features.items() if k.startswith('contains_'))
-    )
-    for url in re.findall(r'https?://\S+', text):
-        if analyze_url(url)['is_suspicious']:
-            score += 25
-    return 'high_risk' if score >= 50 else 'medium_risk' if score >= 25 else 'low_risk'
+# Load AI models - we'll load them lazily when needed
+scam_detector = None
 
 
-def analyze_content(content):
-    """Analyze email/SMS content for threats"""
-    results = {
-        'score': 0,  # 0-100
-        'risk_level': 'unknown',
-        'threats_detected': [],
-        'recommendations': [],
-        'urls_analysis': []
-    }
-    
-    # Basic checks
-    if not content.strip():
-        results['risk_level'] = 'unknown'
-        results['recommendations'].append("Empty content provided. Please submit text to analyze.")
-        return results
-    
-    # Look for URLs in the content
-    urls = re.findall(r'https?://(?:[-\w.]|(?:%[\da-fA-F]{2}))+', content)
-    if len(urls) > 0:
-        results['threats_detected'].append(f"Contains {len(urls)} URL(s)")
-        
-        # Analyze each URL
-        for url in urls:
-            url_analysis = analyze_url(url)
-            if url_analysis['is_suspicious']:
-                results['urls_analysis'].append({
-                    'url': url,
-                    'is_suspicious': True,
-                    'reasons': url_analysis['reasons']
-                })
-            else:
-                results['urls_analysis'].append({
-                    'url': url,
-                    'is_suspicious': False,
-                    'reasons': ["No immediate red flags detected"]
-                })
-    
-    # Use ML model to predict risk level
-    ml_result = ml_prediction(content)
-    
-    if ml_result == 'high_risk':
-        results['risk_level'] = 'high'
-        results['score'] = 85
-        results['threats_detected'].append("Machine learning model classified this as high risk")
-        results['recommendations'].append("Do not respond to this message")
-        results['recommendations'].append("Do not click any links in this message")
-        results['recommendations'].append("Do not provide any personal information")
-        results['recommendations'].append("Report this as phishing to your email provider")
-        
-    elif ml_result == 'medium_risk':
-        results['risk_level'] = 'medium'
-        results['score'] = 50
-        results['threats_detected'].append("Machine learning model found some suspicious patterns")
-        results['recommendations'].append("Proceed with caution")
-        results['recommendations'].append("Verify the sender through official channels before responding")
-        results['recommendations'].append("Do not click links unless absolutely necessary")
-        if len(urls) > 0:
-            results['recommendations'].append("If you must visit a link, type the main domain directly in your browser instead")
-            
-    else:
-        results['risk_level'] = 'low'
-        results['score'] = 15
-        results['recommendations'].append("Message appears to be legitimate, but always stay vigilant")
-        
-    # Special patterns to check
-    if re.search(r'(urgent|immediate|alert|attention|warning|action required)', content.lower()):
-        results['threats_detected'].append("Uses urgency tactics to prompt hasty action")
-        results['score'] += 10
-        
-    if re.search(r'bank|account|verify|password|login|credentials|ssn|social security', content.lower()):
-        results['threats_detected'].append("Requests sensitive personal or financial information")
-        results['score'] += 15
-        
-    if re.search(r'won|winner|lottery|prize|million|reward|gift card', content.lower()):
-        results['threats_detected'].append("Promises unrealistic rewards or prizes")
-        results['score'] += 15
-        
-    if content.isupper() or re.search(r'[!]{2,}', content):
-        results['threats_detected'].append("Uses excessive capitalization or punctuation")
-        results['score'] += 5
-        
-    # Cap the score at 100
-    results['score'] = min(results['score'], 100)
-    
-    # Set overall risk level based on final score
-    if results['score'] >= 70:
-        results['risk_level'] = 'high'
-    elif results['score'] >= 40:
-        results['risk_level'] = 'medium'
-    elif results['score'] > 0:
-        results['risk_level'] = 'low'
-        
-    return results
+def get_scam_detector():
+    global scam_detector
+    if scam_detector is None:
+        try:
+            # Load a smaller model for faster inference
+            model_name = "distilbert-base-uncased-finetuned-sst-2-english"
+            scam_detector = pipeline("text-classification", model=model_name)
+            logger.info(f"Loaded model: {model_name}")
+        except Exception as e:
+            logger.error(f"Error loading model: {e}")
+            # Fallback to rule-based detection only
+            scam_detector = None
+    return scam_detector
 
-# Routes
+
+# User model for login system
+class User(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    email = db.Column(db.String(100), unique=True)
+    password = db.Column(db.String(200))
+    name = db.Column(db.String(100))
+
+    def __repr__(self):
+        return f'<User {self.email}>'
+
+
+# Message analysis history
+class MessageAnalysis(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey('user.id'))
+    content_type = db.Column(db.String(10))  # 'email' or 'sms'
+    content = db.Column(db.Text)
+    is_scam = db.Column(db.Boolean)
+    confidence = db.Column(db.Float)
+    reason = db.Column(db.Text)
+    analysis_date = db.Column(db.DateTime, default=db.func.current_timestamp())
+
+    def __repr__(self):
+        return f'<Analysis {self.id}: {"Scam" if self.is_scam else "Legitimate"}>'
+
+
+# Routes for home page
 @app.route('/')
-def home():
-    return redirect(url_for('login'))
+def index():
+    return render_template('index.html')
+
+
+# Routes for authentication
+@app.route('/register', methods=['GET', 'POST'])
+def register():
+    if request.method == 'POST':
+        email = request.form.get('email')
+        name = request.form.get('name')
+        password = request.form.get('password')
+
+        # Check if user already exists
+        existing_user = User.query.filter_by(email=email).first()
+        if existing_user:
+            flash('Email already registered. Please log in.')
+            return redirect(url_for('login'))
+
+        # Create new user
+        new_user = User(
+            email=email,
+            name=name,
+            password=generate_password_hash(password)
+        )
+
+        try:
+            db.session.add(new_user)
+            db.session.commit()
+            flash('Registration successful! Please log in.')
+            return redirect(url_for('login'))
+        except Exception as e:
+            db.session.rollback()
+            flash(f'Error creating account: {str(e)}')
+
+    return render_template('register.html')
+
 
 @app.route('/login', methods=['GET', 'POST'])
 def login():
-    form = LoginForm()
-    
-    if form.validate_on_submit():
-        username = form.username.data
-        password = form.password.data
-        
-        conn = get_db_connection()
-        user = conn.execute('SELECT * FROM users WHERE username = ?', (username,)).fetchone()
-        conn.close()
-        
-        if user and user['password'] == hashlib.sha256(password.encode()).hexdigest():
-            session['user_id'] = user['id']
-            session['username'] = user['username']
+    if request.method == 'POST':
+        email = request.form.get('email')
+        password = request.form.get('password')
+
+        user = User.query.filter_by(email=email).first()
+        if user and check_password_hash(user.password, password):
+            session['user_id'] = user.id
+            session['user_email'] = user.email
+            session['user_name'] = user.name
+            flash('Login successful!')
             return redirect(url_for('dashboard'))
-        else:
-            flash('Invalid username or password', 'danger')
-            
-    return render_template('login.html', form=form)
 
-@app.route('/register', methods=['GET', 'POST'])
-def register():
-    form = RegisterForm()
-    
-    if form.validate_on_submit():
-        username = form.username.data
-        email = form.email.data
-        password = hashlib.sha256(form.password.data.encode()).hexdigest()
-        
-        conn = get_db_connection()
-        
-        try:
-            conn.execute('INSERT INTO users (username, email, password) VALUES (?, ?, ?)',
-                      (username, email, password))
-            conn.commit()
-            flash('Registration successful! Please login.', 'success')
-            return redirect(url_for('login'))
-        except sqlite3.IntegrityError:
-            flash('Username or email already exists', 'danger')
-        finally:
-            conn.close()
-            
-    return render_template('register.html', form=form)
+        flash('Invalid credentials. Please try again.')
 
-@app.route('/dashboard')
-def dashboard():
-    if 'user_id' not in session:
-        return redirect(url_for('login'))
-    
-    scan_form = ScanForm()
-    
-    # Get recent scan history
-    conn = get_db_connection()
-    history = conn.execute('''
-        SELECT * FROM scan_history 
-        WHERE user_id = ? 
-        ORDER BY scanned_at DESC LIMIT 5
-    ''', (session['user_id'],)).fetchall()
-    conn.close()
-    
-    return render_template('dashboard.html', 
-                           username=session['username'],
-                           scan_form=scan_form,
-                           history=history)
+    return render_template('login.html')
 
-@app.route('/scan', methods=['POST'])
-def scan():
-    if 'user_id' not in session:
-        return redirect(url_for('login'))
-    
-    form = ScanForm()
-    
-    if form.validate_on_submit():
-        content = form.content.data
-        analysis_result = analyze_content(content)
-        
-        # Store scan result
-        conn = get_db_connection()
-        conn.execute('''
-            INSERT INTO scan_history (user_id, content, result)
-            VALUES (?, ?, ?)
-        ''', (session['user_id'], content, str(analysis_result)))
-        conn.commit()
-        conn.close()
-        
-        return render_template('result.html', 
-                              content=content,
-                              result=analysis_result)
-    
-    return redirect(url_for('dashboard'))
 
 @app.route('/logout')
 def logout():
     session.clear()
-    return redirect(url_for('login'))
+    flash('You have been logged out.')
+    return redirect(url_for('index'))
 
-@app.route('/history')
-def history():
+
+@app.route('/dashboard')
+def dashboard():
     if 'user_id' not in session:
+        flash('Please log in to access your dashboard.')
         return redirect(url_for('login'))
-    
-    conn = get_db_connection()
-    history = conn.execute('''
-        SELECT * FROM scan_history 
-        WHERE user_id = ? 
-        ORDER BY scanned_at DESC
-    ''', (session['user_id'],)).fetchall()
-    conn.close()
-    
-    return render_template('history.html', history=history)
 
-# Templates
-@app.route('/templates')
-def get_templates():
-    """Return HTML templates for the front-end"""
-    templates = {
-        'login.html': '''
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>X-AI - Login</title>
-    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/bootstrap/5.3.0/css/bootstrap.min.css">
-    <style>
-        body {
-            background-color: #f8f9fa;
-            padding-top: 50px;
+    # Get user's history
+    history = MessageAnalysis.query.filter_by(user_id=session['user_id']).order_by(
+        MessageAnalysis.analysis_date.desc()).limit(10).all()
+
+    return render_template('dashboard.html', history=history)
+
+
+@app.route('/analyze', methods=['GET', 'POST'])
+def analyze():
+    if 'user_id' not in session:
+        flash('Please log in to analyze messages.')
+        return redirect(url_for('login'))
+
+    if request.method == 'POST':
+        content_type = request.form.get('type')  # 'email' or 'sms'
+        content = request.form.get('content')
+
+        if not content:
+            flash('Please provide content to analyze.')
+            return render_template('analyze.html')
+
+        # Analyze content
+        analysis_result = analyze_text_for_scam(content)
+
+        # Check URLs if present
+        urls = extract_urls(content)
+        url_analysis = {}
+        for url in urls:
+            url_analysis[url] = check_url_safety(url)
+
+        # Save analysis to database
+        new_analysis = MessageAnalysis(
+            user_id=session['user_id'],
+            content_type=content_type,
+            content=content,
+            is_scam=analysis_result['is_scam'],
+            confidence=analysis_result['confidence'],
+            reason=analysis_result['reason']
+        )
+
+        try:
+            db.session.add(new_analysis)
+            db.session.commit()
+        except Exception as e:
+            db.session.rollback()
+            logger.error(f"Error saving analysis: {e}")
+
+        return render_template(
+            'result.html',
+            content=content,
+            content_type=content_type,
+            result=analysis_result,
+            urls=url_analysis
+        )
+
+    return render_template('analyze.html')
+
+
+# API for scam detection
+@app.route('/api/analyze', methods=['POST'])
+def api_analyze_content():
+    if not request.is_json:
+        return jsonify({'error': 'Request must be JSON'}), 400
+
+    # Get authentication token or check session as needed
+    # For demo, we're using session, but in production use proper API authentication
+    if 'user_id' not in session:
+        return jsonify({'error': 'Authentication required'}), 401
+
+    data = request.json
+    content_type = data.get('type', 'unknown')  # 'email' or 'sms'
+    content = data.get('content')
+
+    if not content:
+        return jsonify({'error': 'No content provided'}), 400
+
+    # Basic content analysis
+    result = analyze_text_for_scam(content)
+
+    # Check URLs if present
+    urls = extract_urls(content)
+    url_safety = {}
+    for url in urls:
+        url_safety[url] = check_url_safety(url)
+
+    # Save to database
+    new_analysis = MessageAnalysis(
+        user_id=session['user_id'],
+        content_type=content_type,
+        content=content,
+        is_scam=result['is_scam'],
+        confidence=result['confidence'],
+        reason=result['reason']
+    )
+
+    try:
+        db.session.add(new_analysis)
+        db.session.commit()
+    except Exception as e:
+        db.session.rollback()
+        logger.error(f"Error saving API analysis: {e}")
+
+    return jsonify({
+        'is_scam': result['is_scam'],
+        'confidence': result['confidence'],
+        'reason': result['reason'],
+        'urls': url_safety
+    })
+
+
+def analyze_text_for_scam(text):
+    # Enhanced rule-based filters with names, patterns, examples, and explanations
+    red_flag_rules = [
+        {
+            'name': 'Urgency Tactics',
+            'pattern': r'\b(urgent|immediate action|verify your account|act now|right away)\b',
+            'example': 'Your account will be suspended unless you verify immediately',
+            'explanation': 'Creates false urgency to bypass rational thinking'
+        },
+        {
+            'name': 'Too Good To Be True',
+            'pattern': r'\b(you have won|lottery|prize|million dollars|free gift|no cost)\b',
+            'example': 'You have won a $1 million lottery prize!',
+            'explanation': 'Classic advance-fee fraud technique offering unrealistic rewards'
+        },
+        {
+            'name': 'Financial Credential Request',
+            'pattern': r'\b(bank account.*verify|update.*payment information|credit card details)\b',
+            'example': 'Please update your bank account information to continue service',
+            'explanation': 'Attempts to steal financial credentials through fake requests'
+        },
+        {
+            'name': 'Fake Security Alert',
+            'pattern': r'\b(password.*expired|security.*breach|account.*compromised|suspicious activity)\b',
+            'example': 'We detected suspicious activity on your account',
+            'explanation': 'Fake security alerts designed to harvest credentials'
+        },
+        {
+            'name': 'Generic Greeting',
+            'pattern': r'\b(dear (customer|user|account holder|valued member)|hello friend)\b',
+            'example': 'Dear valued customer, your account needs verification',
+            'explanation': 'Impersonal greetings often used in mass phishing attempts'
+        },
+        {
+            'name': 'Payment Demand',
+            'pattern': r'\b(pay (now|immediately)|outstanding balance|overdue payment)\b',
+            'example': 'Your account has an overdue payment of $299.99',
+            'explanation': 'Fake payment demands to steal money'
+        },
+        {
+            'name': 'Government Impersonation',
+            'pattern': r'\b(irs|social security|tax refund|government grant)\b',
+            'example': 'The IRS requires immediate payment for back taxes',
+            'explanation': 'Scammers often impersonate government agencies'
+        },
+        {
+            'name': 'Poor Grammar/Spelling',
+            'pattern': r'\b(kindly do the needful|urgently require|pls|acount|informations)\b',
+            'example': 'Kindly do the needful and send informations',
+            'explanation': 'Poor grammar and spelling are common in scam messages'
         }
-        .login-container {
-            max-width: 400px;
-            margin: 0 auto;
-            padding: 20px;
-            background-color: white;
-            border-radius: 10px;
-            box-shadow: 0 0 10px rgba(0,0,0,0.1);
-        }
-        .logo {
-            text-align: center;
-            margin-bottom: 20px;
-        }
-        .logo h1 {
-            color: #0d6efd;
-            font-weight: bold;
-        }
-    </style>
-</head>
-<body>
-    <div class="container">
-        <div class="login-container">
-            <div class="logo">
-                <h1>X-AI</h1>
-                <p>Cyber Theft Detection & Prevention</p>
-            </div>
-            
-            {% with messages = get_flashed_messages(with_categories=true) %}
-                {% if messages %}
-                    {% for category, message in messages %}
-                        <div class="alert alert-{{ category }}">{{ message }}</div>
-                    {% endfor %}
-                {% endif %}
-            {% endwith %}
-            
-            <form method="POST" action="{{ url_for('login') }}">
-                {{ form.csrf_token }}
-                <div class="mb-3">
-                    <label for="username" class="form-label">Username</label>
-                    {{ form.username(class="form-control", placeholder="Enter your username") }}
-                </div>
-                <div class="mb-3">
-                    <label for="password" class="form-label">Password</label>
-                    {{ form.password(class="form-control", placeholder="Enter your password") }}
-                </div>
-                <div class="d-grid gap-2">
-                    {{ form.submit(class="btn btn-primary") }}
-                </div>
-                <div class="mt-3 text-center">
-                    <p>Don't have an account? <a href="{{ url_for('register') }}">Register here</a></p>
-                </div>
-            </form>
-        </div>
-    </div>
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/bootstrap/5.3.0/js/bootstrap.bundle.min.js"></script>
-</body>
-</html>
-        ''',
-        
-        'register.html': '''
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>X-AI - Register</title>
-    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/bootstrap/5.3.0/css/bootstrap.min.css">
-    <style>
-        body {
-            background-color: #f8f9fa;
-            padding-top: 50px;
-        }
-        .register-container {
-            max-width: 400px;
-            margin: 0 auto;
-            padding: 20px;
-            background-color: white;
-            border-radius: 10px;
-            box-shadow: 0 0 10px rgba(0,0,0,0.1);
-        }
-        .logo {
-            text-align: center;
-            margin-bottom: 20px;
-        }
-        .logo h1 {
-            color: #0d6efd;
-            font-weight: bold;
-        }
-    </style>
-</head>
-<body>
-    <div class="container">
-        <div class="register-container">
-            <div class="logo">
-                <h1>X-AI</h1>
-                <p>Create a new account</p>
-            </div>
-            
-            {% with messages = get_flashed_messages(with_categories=true) %}
-                {% if messages %}
-                    {% for category, message in messages %}
-                        <div class="alert alert-{{ category }}">{{ message }}</div>
-                    {% endfor %}
-                {% endif %}
-            {% endwith %}
-            
-            <form method="POST" action="{{ url_for('register') }}">
-                {{ form.csrf_token }}
-                <div class="mb-3">
-                    <label for="username" class="form-label">Username</label>
-                    {{ form.username(class="form-control", placeholder="Choose a username") }}
-                </div>
-                <div class="mb-3">
-                    <label for="email" class="form-label">Email</label>
-                    {{ form.email(class="form-control", placeholder="Enter your email") }}
-                </div>
-                <div class="mb-3">
-                    <label for="password" class="form-label">Password</label>
-                    {{ form.password(class="form-control", placeholder="Choose a strong password") }}
-                </div>
-                <div class="mb-3">
-                    <label for="confirm_password" class="form-label">Confirm Password</label>
-                    {{ form.confirm_password(class="form-control", placeholder="Confirm your password") }}
-                </div>
-                <div class="d-grid gap-2">
-                    {{ form.submit(class="btn btn-success") }}
-                </div>
-                <div class="mt-3 text-center">
-                    <p>Already have an account? <a href="{{ url_for('login') }}">Login here</a></p>
-                </div>
-            </form>
-        </div>
-    </div>
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/bootstrap/5.3.0/js/bootstrap.bundle.min.js"></script>
-</body>
-</html>
-        ''',
-        
-        'dashboard.html': '''
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>X-AI - Dashboard</title>
-    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/bootstrap/5.3.0/css/bootstrap.min.css">
-    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0-beta3/css/all.min.css">
-    <style>
-        body {
-            background-color: #f8f9fa;
-        }
-        .sidebar {
-            background-color: #212529;
-            color: white;
-            min-height: 100vh;
-            padding-top: 20px;
-        }
-        .sidebar .nav-link {
-            color: rgba(255,255,255,0.8);
-            padding: 15px 20px;
-            border-radius: 5px;
-            margin: 5px 10px;
-        }
-        .sidebar .nav-link:hover, .sidebar .nav-link.active {
-            background-color: #0d6efd;
-            color: white;
-        }
-        .sidebar .logo {
-            text-align: center;
-            margin-bottom: 30px;
-            padding: 0 20px;
-        }
-        .sidebar .logo h2 {
-            color: #0d6efd;
-        }
-        .main-content {
-            padding: 20px;
-        }
-        .card {
-            border: none;
-            box-shadow: 0 0 10px rgba(0,0,0,0.1);
-            margin-bottom: 20px;
-        }
-        .section-title {
-            margin-bottom: 20px;
-            padding-bottom: 10px;
-            border-bottom: 1px solid #dee2e6;
-        }
-        .scan-form {
-            margin-bottom: 20px;
-        }
-        .scan-form textarea {
-            resize: vertical;
-            min-height: 150px;
-        }
-        .history-item {
-            padding: 10px;
-            border-bottom: 1px solid #eee;
-            cursor: pointer;
-        }
-        .history-item:hover {
-            background-color: #f8f9fa;
-        }
-        .history-item:last-child {
-            border-bottom: none;
-        }
-    </style>
-</head>
-<body>
-    <div class="container-fluid">
-        <div class="row">
-            <!-- Sidebar -->
-            <div class="col-md-3 col-lg-2 d-md-block sidebar collapse">
-                <div class="logo">
-                    <h2>X-AI</h2>
-                    <p>Cyber Theft Detection</p>
-                </div>
-                <ul class="nav flex-column">
-                    <li class="nav-item">
-                        <a class="nav-link active" href="{{ url_for('dashboard') }}">
-                            <i class="fas fa-home me-2"></i> Dashboard
-                        </a>
-                    </li>
-                    <li class="nav-item">
-                        <a class="nav-link" href="{{ url_for('history') }}">
-                            <i class="fas fa-history me-2"></i> Scan History
-                        </a>
-                    </li>
-                    <li class="nav-item mt-auto">
-                        <a class="nav-link" href="{{ url_for('logout') }}">
-                            <i class="fas fa-sign-out-alt me-2"></i> Logout
-                        </a>
-                    </li>
-                </ul>
-            </div>
-            
-            <!-- Main Content -->
-            <main class="col-md-9 ms-sm-auto col-lg-10 px-md-4 main-content">
-                <div class="d-flex justify-content-between flex-wrap flex-md-nowrap align-items-center pt-3 pb-2 mb-3 border-bottom">
-                    <h1 class="h2">Welcome, {{ username }}</h1>
-                </div>
-                
-                <div class="row">
-                    <div class="col-md-8">
-                        <div class="card">
-                            <div class="card-header bg-primary text-white">
-                                <h5 class="mb-0"><i class="fas fa-shield-alt me-2"></i> Scan for Threats</h5>
-                            </div>
-                            <div class="card-body">
-                                <form method="POST" action="{{ url_for('scan') }}" class="scan-form">
-                                    {{ scan_form.csrf_token }}
-                                    <div class="mb-3">
-                                        <label for="content" class="form-label">Paste suspicious email or SMS content</label>
-                                        {{ scan_form.content(class="form-control", placeholder="Paste the full email or SMS content here...") }}
-                                    </div>
-                                    <div class="d-grid gap-2">
-                                        {{ scan_form.submit(class="btn btn-primary btn-lg") }}
-                                    </div>
-                                </form>
-                            </div>
-                        </div>
-                        
-                        <div class="card">
-                            <div class="card-header">
-                                <h5 class="mb-0"><i class="fas fa-info-circle me-2"></i> How to Use</h5>
-                            </div>
-                            <div class="card-body">
-                                <div class="mb-3">
-                                    <h6><i class="fas fa-envelope me-2"></i> For Emails:</h6>
-                                    <p>Copy the entire email content including sender, subject line, and body text. Paste it into the analysis box above and click Scan.</p>
-                                </div>
-                                <div class="mb-3">
-                                    <h6><i class="fas fa-sms me-2"></i> For SMS:</h6>
-                                    <p>Copy the entire message and paste it into the analysis box. Include the sender's number if available.</p>
-                                </div>
-                                <div>
-                                    <h6><i class="fas fa-link me-2"></i> For URLs:</h6>
-                                    <p>Paste the suspicious URL into the analysis box. Our system will analyze it for potential phishing indicators.</p>
-                                </div>
-                            </div>
-                        </div>
-                    </div>
-                    
-                    <div class="col-md-4">
-                        <div class="card">
-                            <div class="card-header bg-info text-white">
-                                <h5 class="mb-0"><i class="fas fa-history me-2"></i> Recent Scans</h5>
-                            </div>
-                            <div class="card-body p-0">
-                                {% if history %}
-                                    <div class="list-group list-group-flush">
-                                        {% for item in history %}
-                                            <div class="history-item">
-                                                <div class="d-flex justify-content-between">
-                                                    <small class="text-muted">{{ item['scanned_at'] }}</small>
-                                                    {% if 'high' in item['result'] %}
-                                                        <span class="badge bg-danger">High Risk</span>
-                                                    {% elif 'medium' in item['result'] %}
-                                                        <span class="badge bg-warning">Medium Risk</span>
-                                                    {% elif 'low' in item['result'] %}
-                                                        <span class="badge bg-success">Low Risk</span>
-                                                    {% else %}
-                                                        <span class="badge bg-secondary">Unknown</span>
-                                                    {% endif %}
-                                                </div>
-                                                <div class="text-truncate mt-1">
-                                                    {{ item['content'][:50] }}{% if item['content']|length > 50 %}...{% endif %}
-                                                </div>
-                                            </div>
-                                        {% endfor %}
-                                    </div>
-                                {% else %}
-                                    <div class="p-3 text-center">
-                                        <p class="text-muted">No scan history yet.</p>
-                                    </div>
-                                {% endif %}
-                            </div>
-                            <div class="card-footer">
-                                <a href="{{ url_for('history') }}" class="btn btn-sm btn-outline-primary w-100">View All History</a>
-                            </div>
-                        </div>
-                        
-                        <div class="card">
-                            <div class="card-header bg-success text-white">
-                                <h5 class="mb-0"><i class="fas fa-chart-pie me-2"></i> Stats</h5>
-                            </div>
-                            <div class="card-body">
-                                <div class="row text-center">
-                                    <div class="col">
-                                        <h3 class="text-primary">{{ history|length }}</h3>
-                                        <small class="text-muted">Total Scans</small>
-                                    </div>
-                                    <div class="col">
-                                        <h3 class="text-danger">
-                                            {% set high_risk = namespace(count=0) %}
-                                            {% for item in history %}
-                                                {% if 'high' in item['result'] %}
-                                                    {% set high_risk.count = high_risk.count + 1 %}
-                                                {% endif %}
-                                            {% endfor %}
-                                            {{ high_risk.count }}
-                                        </h3>
-                                        <small class="text-muted">High Risk</small>
-                                    </div>
-                                </div>
-                            </div>
-                        </div>
-                    </div>
-                </div>
-            </main>
-        </div>
-    </div>
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/bootstrap/5.3.0/js/bootstrap.bundle.min.js"></script>
-</body>
-</html>
-        ''',
-        
-        'result.html': '''
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>X-AI - Scan Results</title>
-    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/bootstrap/5.3.0/css/bootstrap.min.css">
-    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0-beta3/css/all.min.css">
-    <style>
-        body {
-            background-color: #f8f9fa;
-        }
-        .sidebar {
-            background-color: #212529;
-            color: white;
-            min-height: 100vh;
-            padding-top: 20px;
-        }
-        .sidebar .nav-link {
-            color: rgba(255,255,255,0.8);
-            padding: 15px 20px;
-            border-radius: 5px;
-            margin: 5px 10px;
-        }
-        .sidebar .nav-link:hover, .sidebar .nav-link.active {
-            background-color: #0d6efd;
-            color: white;
-        }
-        .sidebar .logo {
-            text-align: center;
-            margin-bottom: 30px;
-            padding: 0 20px;
-        }
-        .sidebar .logo h2 {
-            color: #0d6efd;
-        }
-        .main-content {
-            padding: 20px;
-        }
-        .card {
-            border: none;
-            box-shadow: 0 0 10px rgba(0,0,0,0.1);
-            margin-bottom: 20px;
-        }
-        .risk-meter {
-            height: 40px;
-            border-radius: 20px;
-            overflow: hidden;
-            background-color: #e9ecef;
-            margin: 20px 0;
-        }
-        .risk-level {
-            height: 100%;
-            text-align: center;
-            color: white;
-            font-weight: bold;
-            line-height: 40px;
-            transition: width 0.5s ease-in-out;
-        }
-        .risk-low {
-            background-color: #28a745;
-        }
-        .risk-medium {
-            background-color: #ffc107;
-        }
-        .risk-high {
-            background-color: #dc3545;
-        }
-        .threat-item {
-            margin-bottom: 10px;
-            padding: 10px;
-            border-radius: 5px;
-            background-color: #f8d7da;
-            border-left: 5px solid #dc3545;
-        }
-        .recommendation-item {
-            margin-bottom: 10px;
-            padding: 10px;
-            border-radius: 5px;
-            background-color: #d4edda;
-            border-left: 5px solid #28a745;
-        }
-        .content-preview {
-            background-color: #f8f9fa;
-            padding: 15px;
-            border-radius: 5px;
-            max-height: 200px;
-            overflow-y: auto;
-            margin-bottom: 20px;
-            border: 1px solid #dee2e6;
-        }
-        .url-item {
-            padding: 10px;
-            margin-bottom: 10px;
-            border-radius: 5px;
-        }
-        .url-safe {
-            background-color: #d4edda;
-            border-left: 5px solid #28a745;
-        }
-        .url-suspicious {
-            background-color: #f8d7da;
-            border-left: 5px solid #dc3545;
-        }
-    </style>
-</head>
-<body>
-    <div class="container-fluid">
-        <div class="row">
-            <!-- Sidebar -->
-            <div class="col-md-3 col-lg-2 d-md-block sidebar collapse">
-                <div class="logo">
-                    <h2>X-AI</h2>
-                    <p>Cyber Theft Detection</p>
-                </div>
-                <ul class="nav flex-column">
-                    <li class="nav-item">
-                        <a class="nav-link" href="{{ url_for('dashboard') }}">
-                            <i class="fas fa-home me-2"></i> Dashboard
-                        </a>
-                    </li>
-                    <li class="nav-item">
-                        <a class="nav-link" href="{{ url_for('history') }}">
-                            <i class="fas fa-history me-2"></i> Scan History
-                        </a>
-                    </li>
-                    <li class="nav-item mt-auto">
-                        <a class="nav-link" href="{{ url_for('logout') }}">
-                            <i class="fas fa-sign-out-alt me-2"></i> Logout
-                        </a>
-                    </li>
-                </ul>
-            </div>
-            
-            <!-- Main Content -->
-            <main class="col-md-9 ms-sm-auto col-lg-10 px-md-4 main-content">
-                <div class="d-flex justify-content-between flex-wrap flex-md-nowrap align-items-center pt-3 pb-2 mb-3 border-bottom">
-                    <h1 class="h2">Scan Results</h1>
-                    <div>
-                        <a href="{{ url_for('dashboard') }}" class="btn btn-outline-primary">
-                            <i class="fas fa-arrow-left me-2"></i> Back to Dashboard
-                        </a>
-                    </div>
-                </div>
-                
-                <div class="row">
-                    <div class="col-md-12">
-                        <div class="card">
-                            <div class="card-header">
-                                <h5 class="mb-0">
-                                    {% if result.risk_level == 'high' %}
-                                        <i class="fas fa-exclamation-triangle text-danger me-2"></i>
-                                        <span class="text-danger">High Risk Detected!</span>
-                                    {% elif result.risk_level == 'medium' %}
-                                        <i class="fas fa-exclamation-circle text-warning me-2"></i>
-                                        <span class="text-warning">Medium Risk Detected</span>
-                                    {% elif result.risk_level == 'low' %}
-                                        <i class="fas fa-check-circle text-success me-2"></i>
-                                        <span class="text-success">Low Risk Detected</span>
-                                    {% else %}
-                                        <i class="fas fa-question-circle text-secondary me-2"></i>
-                                        <span class="text-secondary">Unknown Risk</span>
-                                    {% endif %}
-                                </h5>
-                            </div>
-                            <div class="card-body">
-                                <h6>Risk Score: {{ result.score }}/100</h6>
-                                <div class="risk-meter">
-                                    {% if result.risk_level == 'high' %}
-                                        <div class="risk-level risk-high" style="width: {{ result.score }}%;">HIGH RISK</div>
-                                    {% elif result.risk_level == 'medium' %}
-                                        <div class="risk-level risk-medium" style="width: {{ result.score }}%;">MEDIUM RISK</div>
-                                    {% elif result.risk_level == 'low' %}
-                                        <div class="risk-level risk-low" style="width: {{ result.score }}%;">LOW RISK</div>
-                                    {% else %}
-                                        <div class="risk-level" style="width: 0%;"></div>
-                                    {% endif %}
-                                </div>
-                            </div>
-                        </div>
-                    </div>
-                </div>
-                
-                <div class="row">
-                    <div class="col-md-6">
-                        <div class="card">
-                            <div class="card-header bg-danger text-white">
-                                <h5 class="mb-0"><i class="fas fa-bug me-2"></i> Threats Detected</h5>
-                            </div>
-                            <div class="card-body">
-                                {% if result.threats_detected %}
-                                    {% for threat in result.threats_detected %}
-                                        <div class="threat-item">
-                                            <i class="fas fa-exclamation-triangle me-2"></i> {{ threat }}
-                                        </div>
-                                    {% endfor %}
-                                {% else %}
-                                    <p class="text-success"><i class="fas fa-check-circle me-2"></i> No specific threats detected.</p>
-                                {% endif %}
-                            </div>
-                        </div>
-                        
-                        <div class="card">
-                            <div class="card-header bg-primary text-white">
-                                <h5 class="mb-0"><i class="fas fa-file-alt me-2"></i> Content Preview</h5>
-                            </div>
-                            <div class="card-body">
-                                <div class="content-preview">
-                                    {{ content }}
-                                </div>
-                            </div>
-                        </div>
-                    </div>
-                    
-                    <div class="col-md-6">
-                        <div class="card">
-                            <div class="card-header bg-success text-white">
-                                <h5 class="mb-0"><i class="fas fa-shield-alt me-2"></i> Recommendations</h5>
-                            </div>
-                            <div class="card-body">
-                                {% if result.recommendations %}
-                                    {% for recommendation in result.recommendations %}
-                                        <div class="recommendation-item">
-                                            <i class="fas fa-check me-2"></i> {{ recommendation }}
-                                        </div>
-                                    {% endfor %}
-                                {% else %}
-                                    <p class="text-muted">No specific recommendations available.</p>
-                                {% endif %}
-                            </div>
-                        </div>
-                        
-                        {% if result.urls_analysis %}
-                            <div class="card">
-                                <div class="card-header bg-info text-white">
-                                    <h5 class="mb-0"><i class="fas fa-link me-2"></i> URL Analysis</h5>
-                                </div>
-                                <div class="card-body">
-                                    {% for url_data in result.urls_analysis %}
-                                        <div class="url-item {% if url_data.is_suspicious %}url-suspicious{% else %}url-safe{% endif %}">
-                                            <h6>
-                                                {% if url_data.is_suspicious %}
-                                                    <i class="fas fa-exclamation-triangle text-danger me-2"></i>
-                                                    <span class="text-danger">Suspicious URL</span>
-                                                {% else %}
-                                                    <i class="fas fa-check-circle text-success me-2"></i>
-                                                    <span class="text-success">Likely Safe URL</span>
-                                                {% endif %}
-                                            </h6>
-                                            <div class="mb-2 text-break">
-                                                <small>{{ url_data.url }}</small>
-                                            </div>
-                                            <div>
-                                                <strong>Analysis:</strong>
-                                                <ul class="mb-0 mt-1">
-                                                    {% for reason in url_data.reasons %}
-                                                        <li>{{ reason }}</li>
-                                                    {% endfor %}
-                                                </ul>
-                                            </div>
-                                        </div>
-                                    {% endfor %}
-                                </div>
-                            </div>
-                        {% endif %}
-                    </div>
-                </div>
-            </main>
-        </div>
-    </div>
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/bootstrap/5.3.0/js/bootstrap.bundle.min.js"></script>
-</body>
-</html>
-        ''',
-        
-        'history.html': '''
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>X-AI - Scan History</title>
-    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/bootstrap/5.3.0/css/bootstrap.min.css">
-    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0-beta3/css/all.min.css">
-    <style>
-        body {
-            background-color: #f8f9fa;
-        }
-        .sidebar {
-            background-color: #212529;
-            color: white;
-            min-height: 100vh;
-            padding-top: 20px;
-        }
-        .sidebar .nav-link {
-            color: rgba(255,255,255,0.8);
-            padding: 15px 20px;
-            border-radius: 5px;
-            margin: 5px 10px;
-        }
-        .sidebar .nav-link:hover, .sidebar .nav-link.active {
-            background-color: #0d6efd;
-            color: white;
-        }
-        .sidebar .logo {
-            text-align: center;
-            margin-bottom: 30px;
-            padding: 0 20px;
-        }
-        .sidebar .logo h2 {
-            color: #0d6efd;
-        }
-        .main-content {
-            padding: 20px;
-        }
-        .card {
-            border: none;
-            box-shadow: 0 0 10px rgba(0,0,0,0.1);
-            margin-bottom: 20px;
-        }
-        .history-item {
-            padding: 15px;
-            border-bottom: 1px solid #eee;
-        }
-        .history-item:last-child {
-            border-bottom: none;
-        }
-        .history-content {
-            background-color: #f8f9fa;
-            padding: 10px;
-            border-radius: 5px;
-            margin-top: 10px;
-            max-height: 100px;
-            overflow-y: auto;
-        }
-    </style>
-</head>
-<body>
-    <div class="container-fluid">
-        <div class="row">
-            <!-- Sidebar -->
-            <div class="col-md-3 col-lg-2 d-md-block sidebar collapse">
-                <div class="logo">
-                    <h2>X-AI</h2>
-                    <p>Cyber Theft Detection</p>
-                </div>
-                <ul class="nav flex-column">
-                    <li class="nav-item">
-                        <a class="nav-link" href="{{ url_for('dashboard') }}">
-                            <i class="fas fa-home me-2"></i> Dashboard
-                        </a>
-                    </li>
-                    <li class="nav-item">
-                        <a class="nav-link active" href="{{ url_for('history') }}">
-                            <i class="fas fa-history me-2"></i> Scan History
-                        </a>
-                    </li>
-                    <li class="nav-item mt-auto">
-                        <a class="nav-link" href="{{ url_for('logout') }}">
-                            <i class="fas fa-sign-out-alt me-2"></i> Logout
-                        </a>
-                    </li>
-                </ul>
-            </div>
-            
-            <!-- Main Content -->
-            <main class="col-md-9 ms-sm-auto col-lg-10 px-md-4 main-content">
-                <div class="d-flex justify-content-between flex-wrap flex-md-nowrap align-items-center pt-3 pb-2 mb-3 border-bottom">
-                    <h1 class="h2">Scan History</h1>
-                </div>
-                
-                <div class="card">
-                    <div class="card-header bg-primary text-white">
-                        <h5 class="mb-0"><i class="fas fa-history me-2"></i> Your Scan History</h5>
-                    </div>
-                    <div class="card-body p-0">
-                        {% if history %}
-                            {% for item in history %}
-                                <div class="history-item">
-                                    <div class="d-flex justify-content-between align-items-center mb-2">
-                                        <div>
-                                            <span class="text-muted me-3">{{ item['scanned_at'] }}</span>
-                                            {% if 'high' in item['result'] %}
-                                                <span class="badge bg-danger">High Risk</span>
-                                            {% elif 'medium' in item['result'] %}
-                                                <span class="badge bg-warning">Medium Risk</span>
-                                            {% elif 'low' in item['result'] %}
-                                                <span class="badge bg-success">Low Risk</span>
-                                            {% else %}
-                                                <span class="badge bg-secondary">Unknown</span>
-                                            {% endif %}
-                                        </div>
-                                    </div>
-                                    <div class="history-content">
-                                        {{ item['content'] }}
-                                    </div>
-                                </div>
-                            {% endfor %}
-                        {% else %}
-                            <div class="p-4 text-center">
-                                <p class="text-muted">No scan history found.</p>
-                                <a href="{{ url_for('dashboard') }}" class="btn btn-primary">Go to Dashboard to Scan</a>
-                            </div>
-                        {% endif %}
-                    </div>
-                </div>
-            </main>
-        </div>
-    </div>
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/bootstrap/5.3.0/js/bootstrap.bundle.min.js"></script>
-</body>
-</html>
-        '''
+    ]
+
+    detected_patterns = []
+    text_lower = text.lower()
+
+    for rule in red_flag_rules:
+        matches = re.finditer(rule['pattern'], text_lower, re.IGNORECASE)
+        for match in matches:
+            matched_text = text[match.start():match.end()]
+            detected_patterns.append({
+                'name': rule['name'],
+                'pattern': rule['pattern'],
+                'matched_text': matched_text,
+                'position': match.start(),
+                'explanation': rule['explanation'],
+                'example': rule['example']
+            })
+
+    # AI-based analysis if available
+    model_score = 0.5  # Default neutral score
+    detector = get_scam_detector()
+
+    if detector:
+        try:
+            # Ensure text isn't too long for the model
+            analysis_text = text[:512] if len(text) > 512 else text
+            result = detector(analysis_text)
+            # For this model, "POSITIVE" means legitimate (not scam)
+            model_score = result[0]['score'] if result[0]['label'] == 'POSITIVE' else 1 - result[0]['score']
+        except Exception as e:
+            logger.error(f"Error in AI analysis: {e}")
+            # Fall back to rule-based only
+            model_score = 0.5
+
+    # Combined analysis
+    rule_based_weight = 0.7
+    ai_weight = 0.3
+
+    # If we found rule-based red flags, this strongly suggests a scam
+    rule_based_score = min(0.9, 0.5 + (0.1 * len(detected_patterns))) if detected_patterns else 0.3
+
+    # Final weighted score (higher = more likely a scam)
+    combined_score = (rule_based_weight * rule_based_score) + (ai_weight * (1 - model_score))
+
+    # Decision threshold
+    is_scam = combined_score > 0.5
+
+    # Explanation
+    if detected_patterns:
+        unique_categories = list({pattern['name'] for pattern in detected_patterns})
+        reason = f"Detected {len(unique_categories)} suspicious patterns: {', '.join(unique_categories[:3])}"
+    elif combined_score > 0.5:
+        reason = "AI analysis indicates potential scam based on content patterns"
+    else:
+        reason = "Content appears legitimate with no obvious scam indicators"
+
+    return {
+        'is_scam': is_scam,
+        'confidence': min(round(combined_score, 4), 0.99),
+        'reason': reason,
+        'detected_patterns': detected_patterns,
+        'text': text  # Include original text for highlighting
     }
-    
-    return templates.get(template_name, "Template not found.")
+
+def extract_urls(text):
+    url_pattern = r'https?://[^\s<>"]+|www\.[^\s<>"]+'
+    return re.findall(url_pattern, text)
+
+
+def check_url_safety(url):
+    # Enhanced URL safety check with more detailed explanations
+    results = {
+        'safe': True,
+        'reason': 'No obvious threats detected',
+        'details': []
+    }
+
+    # Check for URL shorteners (often used in phishing)
+    suspicious_domains = ['bit.ly', 'tinyurl.com', 'goo.gl', 't.co', 'tiny.cc', 'is.gd', 'cli.gs', 'ow.ly']
+    for domain in suspicious_domains:
+        if domain in url.lower():
+            results['safe'] = False
+            results['reason'] = 'URL shortener detected - potential phishing risk'
+            results['details'].append({
+                'issue': 'URL Shortener',
+                'explanation': 'URL shorteners hide the actual destination, making it easier to disguise malicious links.'
+            })
+            break
+
+    # Check for suspicious TLDs often used in phishing
+    suspicious_tlds = ['.tk', '.ml', '.ga', '.cf', '.gq', '.xyz']
+    for tld in suspicious_tlds:
+        if url.lower().endswith(tld):
+            results['safe'] = False
+            results['reason'] = f'Domain uses {tld} TLD - commonly used in phishing'
+            results['details'].append({
+                'issue': 'Suspicious TLD',
+                'explanation': f'The domain uses {tld} TLD which is often available for free and commonly used in phishing campaigns.'
+            })
+            break
+
+    # Check for IP addresses in URLs (suspicious)
+    ip_pattern = r'https?://\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}'
+    if re.match(ip_pattern, url):
+        results['safe'] = False
+        results['reason'] = 'IP address used in URL instead of domain name - suspicious'
+        results['details'].append({
+            'issue': 'IP Address URL',
+            'explanation': 'Legitimate websites typically use domain names, not raw IP addresses. IP addresses in URLs are often used to hide the true identity of the website.'
+        })
+
+    # Check for excessive subdomains (can be a sign of phishing)
+    parts = url.split('/')
+    if len(parts) > 3:
+        domain_part = parts[2]
+        if domain_part.count('.') > 3:
+            results['safe'] = False
+            results['reason'] = 'Excessive subdomains detected - potential phishing technique'
+            results['details'].append({
+                'issue': 'Multiple Subdomains',
+                'explanation': 'The URL contains an unusual number of subdomains, which is often used to make phishing URLs look legitimate.'
+            })
+
+    # Check for deceptive domains (e.g., paypal-secure.something.com)
+    trusted_brands = ['paypal', 'apple', 'microsoft', 'amazon', 'google', 'facebook', 'netflix', 'bank']
+    domain_part = url.split('/')[2] if len(url.split('/')) > 2 else ""
+
+    for brand in trusted_brands:
+        if brand in domain_part.lower() and not domain_part.lower().startswith(brand + '.'):
+            results['safe'] = False
+            results['reason'] = f'Potential brand impersonation ({brand})'
+            results['details'].append({
+                'issue': 'Brand Impersonation',
+                'explanation': f'This URL appears to reference {brand} but is not from the official {brand} domain.'
+            })
+            break
+
+    return results
+
+
+@app.errorhandler(404)
+def page_not_found(e):
+    return render_template('404.html'), 404
+
+
+@app.errorhandler(500)
+def internal_server_error(e):
+    return render_template('500.html'), 500
+
 
 if __name__ == '__main__':
+    with app.app_context():
+        db.create_all()
     app.run(debug=True)
